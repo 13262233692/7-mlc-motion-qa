@@ -2,6 +2,7 @@
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
+import numpy as np
 from sqlalchemy.orm import Session
 
 from mlc_qa import models, schemas
@@ -237,6 +238,8 @@ class CRUDQAResult:
         db_obj = models.QAResult(
             plan_id=obj_in.plan_id,
             beam_id=obj_in.beam_id,
+            fraction_number=obj_in.fraction_number,
+            plan_version=obj_in.plan_version,
             log_filename=obj_in.log_filename,
             max_leaf_deviation_mm=obj_in.max_leaf_deviation_mm,
             mean_leaf_deviation_mm=obj_in.mean_leaf_deviation_mm,
@@ -263,6 +266,8 @@ class CRUDQAResult:
         analysis_result: QAAnalysisResult,
         log_filename: Optional[str] = None,
         notes: Optional[str] = None,
+        fraction_number: int = 0,
+        plan_version: int = 1,
     ) -> models.QAResult:
         """Create QA result from analysis result."""
         gantry_range = (
@@ -287,6 +292,8 @@ class CRUDQAResult:
                 gantry_angle_range=gantry_range,
                 overall_pass=1 if analysis_result.overall_pass else 0,
                 notes=notes,
+                fraction_number=fraction_number,
+                plan_version=plan_version,
             ),
         )
 
@@ -404,8 +411,187 @@ class CRUDLeafErrorSample:
         ).limit(limit).all()
 
 
+class CRUDFractionQASummary:
+    """CRUD operations for FractionQASummary."""
+
+    @staticmethod
+    def create(
+        db: Session,
+        obj_in: schemas.FractionQASummaryCreate,
+    ) -> models.FractionQASummary:
+        """Create a new fraction QA summary."""
+        db_obj = models.FractionQASummary(
+            plan_id=obj_in.plan_id,
+            beam_id=obj_in.beam_id,
+            fraction_number=obj_in.fraction_number,
+            plan_version=obj_in.plan_version,
+            num_qa_results=obj_in.num_qa_results,
+            latest_qa_result_id=obj_in.latest_qa_result_id,
+            max_leaf_deviation_mm=obj_in.max_leaf_deviation_mm,
+            mean_leaf_deviation_mm=obj_in.mean_leaf_deviation_mm,
+            rmse_mm=obj_in.rmse_mm,
+            dose_rate_deviation_pct=obj_in.dose_rate_deviation_pct,
+            control_point_pass_rate_pct=obj_in.control_point_pass_rate_pct,
+            overall_pass_rate_pct=obj_in.overall_pass_rate_pct,
+            trend_label=obj_in.trend_label,
+            trend_confidence=obj_in.trend_confidence,
+            deviation_delta_from_previous_mm=obj_in.deviation_delta_from_previous_mm,
+        )
+        db.add(db_obj)
+        db.commit()
+        db.refresh(db_obj)
+        return db_obj
+
+    @staticmethod
+    def get(db: Session, summary_id: int) -> Optional[models.FractionQASummary]:
+        """Get fraction QA summary by ID."""
+        return db.query(models.FractionQASummary).filter(
+            models.FractionQASummary.id == summary_id
+        ).first()
+
+    @staticmethod
+    def get_by_fraction(
+        db: Session,
+        plan_id: int,
+        beam_id: int,
+        fraction_number: int,
+        plan_version: int = 1,
+    ) -> Optional[models.FractionQASummary]:
+        """Get fraction summary by plan+beam+fraction+version."""
+        return db.query(models.FractionQASummary).filter(
+            models.FractionQASummary.plan_id == plan_id,
+            models.FractionQASummary.beam_id == beam_id,
+            models.FractionQASummary.fraction_number == fraction_number,
+            models.FractionQASummary.plan_version == plan_version,
+        ).first()
+
+    @staticmethod
+    def list_by_plan_beam(
+        db: Session,
+        plan_id: int,
+        beam_id: int,
+        plan_version: Optional[int] = None,
+    ) -> List[models.FractionQASummary]:
+        """List all fraction summaries for a plan+beam."""
+        query = db.query(models.FractionQASummary).filter(
+            models.FractionQASummary.plan_id == plan_id,
+            models.FractionQASummary.beam_id == beam_id,
+        )
+        if plan_version is not None:
+            query = query.filter(
+                models.FractionQASummary.plan_version == plan_version
+            )
+        return query.order_by(
+            models.FractionQASummary.fraction_number.asc()
+        ).all()
+
+    @staticmethod
+    def list_by_plan(
+        db: Session,
+        plan_id: int,
+    ) -> List[models.FractionQASummary]:
+        """List all fraction summaries for a plan."""
+        return db.query(models.FractionQASummary).filter(
+            models.FractionQASummary.plan_id == plan_id
+        ).order_by(
+            models.FractionQASummary.plan_version.asc(),
+            models.FractionQASummary.fraction_number.asc(),
+        ).all()
+
+    @staticmethod
+    def update(
+        db: Session,
+        summary_id: int,
+        update_data: Dict[str, Any],
+    ) -> Optional[models.FractionQASummary]:
+        """Update an existing fraction QA summary."""
+        summary = CRUDFractionQASummary.get(db, summary_id)
+        if not summary:
+            return None
+        for key, value in update_data.items():
+            if hasattr(summary, key) and value is not None:
+                setattr(summary, key, value)
+        db.commit()
+        db.refresh(summary)
+        return summary
+
+    @staticmethod
+    def update_from_qa_result(
+        db: Session,
+        qa_result: models.QAResult,
+    ) -> models.FractionQASummary:
+        """Update or create fraction summary from a new QA result.
+
+        Aggregates metrics:
+        - If this is the first result for this fraction, create a new summary
+        - If a summary exists, update with latest values
+        """
+        existing = CRUDFractionQASummary.get_by_fraction(
+            db,
+            plan_id=qa_result.plan_id,
+            beam_id=qa_result.beam_id,
+            fraction_number=qa_result.fraction_number,
+            plan_version=qa_result.plan_version,
+        )
+
+        all_results = db.query(models.QAResult).filter(
+            models.QAResult.plan_id == qa_result.plan_id,
+            models.QAResult.beam_id == qa_result.beam_id,
+            models.QAResult.fraction_number == qa_result.fraction_number,
+            models.QAResult.plan_version == qa_result.plan_version,
+        ).all()
+
+        num_results = len(all_results)
+        pass_count = sum(1 for r in all_results if r.overall_pass)
+        pass_rate_pct = (pass_count / num_results * 100.0) if num_results > 0 else 0.0
+
+        max_devs = [r.max_leaf_deviation_mm for r in all_results if r.max_leaf_deviation_mm is not None]
+        mean_devs = [r.mean_leaf_deviation_mm for r in all_results if r.mean_leaf_deviation_mm is not None]
+        rmse_vals = [r.rmse_mm for r in all_results if r.rmse_mm is not None]
+        dose_devs = [r.dose_rate_deviation_pct for r in all_results if r.dose_rate_deviation_pct is not None]
+        cp_rates = [r.control_point_pass_rate_pct for r in all_results if r.control_point_pass_rate_pct is not None]
+
+        latest = qa_result
+
+        update_dict = {
+            "num_qa_results": num_results,
+            "latest_qa_result_id": qa_result.id,
+            "max_leaf_deviation_mm": max(max_devs) if max_devs else None,
+            "mean_leaf_deviation_mm": float(np.mean(mean_devs)) if mean_devs else None,
+            "rmse_mm": float(np.mean(rmse_vals)) if rmse_vals else None,
+            "dose_rate_deviation_pct": float(np.mean(dose_devs)) if dose_devs else None,
+            "control_point_pass_rate_pct": float(np.mean(cp_rates)) if cp_rates else None,
+            "overall_pass_rate_pct": pass_rate_pct,
+            "qa_date": qa_result.qa_date,
+        }
+
+        if existing:
+            updated = CRUDFractionQASummary.update(db, existing.id, update_dict)
+            return updated
+        else:
+            summary_in = schemas.FractionQASummaryCreate(
+                plan_id=qa_result.plan_id,
+                beam_id=qa_result.beam_id,
+                fraction_number=qa_result.fraction_number,
+                plan_version=qa_result.plan_version,
+                **{k: v for k, v in update_dict.items() if k != "qa_date"}
+            )
+            return CRUDFractionQASummary.create(db, summary_in)
+
+    @staticmethod
+    def delete(db: Session, summary_id: int) -> bool:
+        """Delete a fraction QA summary."""
+        summary = CRUDFractionQASummary.get(db, summary_id)
+        if summary:
+            db.delete(summary)
+            db.commit()
+            return True
+        return False
+
+
 patient_alias = CRUDPatientAlias()
 plan = CRUDPlan()
 beam = CRUDBeam()
 qa_result = CRUDQAResult()
 leaf_error_sample = CRUDLeafErrorSample()
+fraction_qa_summary = CRUDFractionQASummary()

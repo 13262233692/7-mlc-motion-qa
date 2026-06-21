@@ -60,6 +60,8 @@ class QAResult(Base):
     id = Column(Integer, primary_key=True, index=True)
     plan_id = Column(Integer, ForeignKey("plan.id"), nullable=False)
     beam_id = Column(Integer, ForeignKey("beam.id"), nullable=False)
+    fraction_number = Column(Integer, default=0, index=True)
+    plan_version = Column(Integer, default=1, index=True)
     log_filename = Column(String(256))
     max_leaf_deviation_mm = Column(Float)
     mean_leaf_deviation_mm = Column(Float)
@@ -81,6 +83,39 @@ class QAResult(Base):
         back_populates="qa_result",
         cascade="all, delete-orphan"
     )
+
+
+class FractionQASummary(Base):
+    """Per-fraction QA summary for trend analysis.
+
+    Aggregates QA results by (plan, beam, fraction_number, plan_version).
+    Used for trend analysis of leaf deviation patterns across treatment sessions.
+    """
+    __tablename__ = "fraction_qa_summary"
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, ForeignKey("plan.id"), nullable=False, index=True)
+    beam_id = Column(Integer, ForeignKey("beam.id"), nullable=False, index=True)
+    fraction_number = Column(Integer, nullable=False, index=True)
+    plan_version = Column(Integer, default=1, index=True)
+
+    num_qa_results = Column(Integer, default=0)
+    latest_qa_result_id = Column(Integer, ForeignKey("qa_result.id"))
+
+    max_leaf_deviation_mm = Column(Float)
+    mean_leaf_deviation_mm = Column(Float)
+    rmse_mm = Column(Float)
+    dose_rate_deviation_pct = Column(Float)
+    control_point_pass_rate_pct = Column(Float)
+    overall_pass_rate_pct = Column(Float)
+
+    trend_label = Column(String(32))
+    trend_confidence = Column(Float)
+    deviation_delta_from_previous_mm = Column(Float)
+
+    qa_date = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class LeafErrorSample(Base):

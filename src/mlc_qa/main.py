@@ -42,6 +42,8 @@ from mlc_qa.calculations import (
     MLCQACalculator,
     CalculationError,
     QAAnalysisResult,
+    TrendAnalyzer,
+    FractionMetrics,
 )
 from mlc_qa.report_generator import generate_qa_report_pdf
 
@@ -172,13 +174,15 @@ async def upload_log(
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
-@app.post("/api/qa/submit", response_model=schemas.QAUploadResponse, tags=["QA"])
+@app.post("/api/qa/submit", response_model=schemas.QASubmitResponse, tags=["QA"])
 async def submit_qa(
     patient_anonymous_id: str = Query(..., description="Anonymous patient identifier"),
     plan_file: UploadFile = File(..., description="DICOM-RT Plan file (JSON or DICOM)"),
     log_file: UploadFile = File(..., description="Treatment log CSV file"),
     beam_name: str = Query(..., description="Beam name to analyze"),
     notes: Optional[str] = Query(None, description="Optional notes"),
+    fraction_number: int = Query(0, description="Fraction number (treatment session number)"),
+    plan_version: int = Query(1, description="Plan version number for re-planning"),
     db: Session = Depends(get_db),
 ):
     """
@@ -259,11 +263,18 @@ async def submit_qa(
             analysis_result=analysis_result,
             log_filename=log_file.filename,
             notes=notes,
+            fraction_number=fraction_number,
+            plan_version=plan_version,
         )
 
-        return schemas.QAUploadResponse(
+        fraction_summary = crud.fraction_qa_summary.update_from_qa_result(
+            db, qa_result_db
+        )
+
+        return schemas.QASubmitResponse(
             success=True,
             qa_result_id=qa_result_db.id,
+            fraction_summary_id=fraction_summary.id,
             message=(
                 f"QA analysis completed. "
                 f"Pass rate: {analysis_result.control_point_pass_rate_pct:.2f}%"
@@ -271,6 +282,8 @@ async def submit_qa(
             max_deviation_mm=analysis_result.max_leaf_deviation_mm,
             pass_rate_pct=analysis_result.control_point_pass_rate_pct,
             overall_pass=analysis_result.overall_pass,
+            fraction_number=fraction_number,
+            plan_version=plan_version,
         )
 
     except MissingControlPointError as e:
@@ -321,6 +334,7 @@ async def get_qa_result(
 @app.get("/api/qa/results/{qa_result_id}/pdf", tags=["QA"])
 async def export_qa_pdf(
     qa_result_id: int,
+    include_trend: bool = Query(True, description="Include fraction trend chart in report"),
     db: Session = Depends(get_db),
 ):
     """Export QA result as PDF report."""
@@ -330,8 +344,14 @@ async def export_qa_pdf(
 
     samples = crud.leaf_error_sample.get_by_qa_result_id(db, qa_result_id)
 
+    fraction_summaries = None
+    if include_trend:
+        fraction_summaries = crud.fraction_qa_summary.list_by_plan_beam(
+            db, result.plan_id, result.beam_id, plan_version=result.plan_version
+        )
+
     try:
-        pdf_content = generate_qa_report_pdf(result, samples)
+        pdf_content = generate_qa_report_pdf(result, samples, fraction_summaries)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
@@ -413,6 +433,139 @@ async def get_patient_plans(
     if patient is None:
         raise HTTPException(status_code=404, detail="Patient not found")
     return crud.plan.get_by_patient_id(db, patient.id)
+
+
+@app.get("/api/plans/{plan_id}/beams/{beam_id}/fractions",
+         response_model=List[schemas.FractionQASummaryResponse],
+         tags=["Fraction"])
+async def list_fraction_summaries(
+    plan_id: int,
+    beam_id: int,
+    plan_version: Optional[int] = Query(None, description="Filter by plan version"),
+    db: Session = Depends(get_db),
+):
+    """List all fraction QA summaries for a plan+beam."""
+    summaries = crud.fraction_qa_summary.list_by_plan_beam(
+        db, plan_id, beam_id, plan_version=plan_version
+    )
+    return summaries
+
+
+@app.get("/api/plans/{plan_id}/beams/{beam_id}/fractions/{fraction_number}",
+         response_model=schemas.FractionQASummaryResponse,
+         tags=["Fraction"])
+async def get_fraction_summary(
+    plan_id: int,
+    beam_id: int,
+    fraction_number: int,
+    plan_version: int = Query(1, description="Plan version number"),
+    db: Session = Depends(get_db),
+):
+    """Get a specific fraction QA summary."""
+    summary = crud.fraction_qa_summary.get_by_fraction(
+        db, plan_id, beam_id, fraction_number, plan_version
+    )
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Fraction summary not found")
+    return summary
+
+
+@app.get("/api/plans/{plan_id}/beams/{beam_id}/trend",
+         response_model=schemas.TrendAnalysisResult,
+         tags=["Fraction"])
+async def get_fraction_trend(
+    plan_id: int,
+    beam_id: int,
+    plan_version: Optional[int] = Query(None, description="Filter by plan version (None for all)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Perform trend analysis on fraction QA results.
+
+    Analyzes leaf deviation and pass rate trends across fractions and returns
+    trend labels (STABLE_NORMAL, GRADUAL_INCREASE, SHARP_INCREASE,
+    SINGLE_SPIKE, IMPROVING, ERRATIC, INSUFFICIENT_DATA, ALL_PASS, ALL_FAIL),
+    chart data, anomaly flags, and per-fraction details.
+    """
+    summaries = crud.fraction_qa_summary.list_by_plan_beam(
+        db, plan_id, beam_id, plan_version=plan_version
+    )
+
+    if not summaries:
+        raise HTTPException(status_code=404, detail="No fraction data found for trend analysis")
+
+    fraction_metrics = []
+    total_qa_results = 0
+    for s in summaries:
+        if (s.max_leaf_deviation_mm is None and s.rmse_mm is None
+                and s.control_point_pass_rate_pct is None):
+            continue
+        fm = FractionMetrics(
+            fraction_number=s.fraction_number,
+            plan_version=s.plan_version,
+            max_leaf_deviation_mm=s.max_leaf_deviation_mm or 0.0,
+            mean_leaf_deviation_mm=s.mean_leaf_deviation_mm or 0.0,
+            rmse_mm=s.rmse_mm or 0.0,
+            pass_rate_pct=s.control_point_pass_rate_pct or 0.0,
+            overall_pass=(s.overall_pass_rate_pct or 0.0) >= 95.0,
+            qa_date=s.qa_date,
+        )
+        fraction_metrics.append(fm)
+        total_qa_results += s.num_qa_results
+
+    if len(fraction_metrics) < 2:
+        return schemas.TrendAnalysisResult(
+            plan_id=plan_id,
+            beam_id=beam_id,
+            total_fractions=len(fraction_metrics),
+            total_qa_results=total_qa_results,
+            plan_versions=sorted({s.plan_version for s in summaries}),
+            trend_label="INSUFFICIENT_DATA",
+            trend_confidence=0.0,
+            overall_trend_description="Insufficient data for trend analysis (need at least 2 fractions)",
+            latest_fraction=fraction_metrics[-1].fraction_number if fraction_metrics else 0,
+            latest_max_deviation_mm=(fraction_metrics[-1].max_leaf_deviation_mm
+                                      if fraction_metrics else None),
+            latest_pass_rate_pct=(fraction_metrics[-1].pass_rate_pct
+                                   if fraction_metrics else None),
+            fractions=[schemas.FractionQASummaryResponse.model_validate(s) for s in summaries],
+            chart_data={},
+            anomaly_flags=[],
+        )
+
+    analyzer = TrendAnalyzer()
+    result = analyzer.analyze(fraction_metrics)
+
+    return schemas.TrendAnalysisResult(
+        plan_id=plan_id,
+        beam_id=beam_id,
+        total_fractions=result.total_fractions,
+        total_qa_results=total_qa_results,
+        plan_versions=result.plan_versions,
+        trend_label=result.trend_label.value,
+        trend_confidence=result.trend_confidence,
+        overall_trend_description=result.overall_description,
+        max_deviation_trend_slope_mm_per_fraction=result.max_deviation_slope,
+        pass_rate_trend_slope_pct_per_fraction=result.pass_rate_slope,
+        latest_fraction=result.latest_fraction,
+        latest_max_deviation_mm=result.latest_max_deviation,
+        latest_pass_rate_pct=result.latest_pass_rate,
+        fractions=[schemas.FractionQASummaryResponse.model_validate(s) for s in summaries],
+        chart_data=result.chart_data,
+        anomaly_flags=result.anomaly_flags,
+    )
+
+
+@app.get("/api/plans/{plan_id}/fractions",
+         response_model=List[schemas.FractionQASummaryResponse],
+         tags=["Fraction"])
+async def list_plan_fractions(
+    plan_id: int,
+    db: Session = Depends(get_db),
+):
+    """List all fraction QA summaries for a plan (all beams and versions)."""
+    summaries = crud.fraction_qa_summary.list_by_plan(db, plan_id)
+    return summaries
 
 
 if __name__ == "__main__":

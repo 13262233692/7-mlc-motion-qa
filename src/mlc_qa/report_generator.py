@@ -6,11 +6,12 @@ Generates professional PDF reports with QA results, including:
 - Pass/fail status
 - Control point analysis
 - Leaf error details
-- Graphical representation (ASCII fallback)
+- Fraction trend analysis (optional)
+- Graphical representation
 """
 import io
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -27,6 +28,10 @@ from reportlab.platypus import (
     ListItem,
 )
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.graphics.shapes import Drawing, Line, PolyLine, String, Rect
+from reportlab.graphics.charts.lineplots import LinePlot
+from reportlab.graphics.charts.barcharts import VerticalBarChart
+from reportlab.graphics.widgets.markers import makeMarker
 
 from mlc_qa import models
 from mlc_qa.config import MAX_LEAF_DEVIATION_THRESHOLD, CONTROL_POINT_PASS_THRESHOLD
@@ -98,6 +103,7 @@ class ReportGenerator:
         self,
         qa_result: models.QAResult,
         leaf_samples: Optional[list] = None,
+        fraction_summaries: Optional[List[models.FractionQASummary]] = None,
     ) -> bytes:
         """
         Generate a PDF report for a QA result.
@@ -105,6 +111,7 @@ class ReportGenerator:
         Args:
             qa_result: QAResult database object.
             leaf_samples: List of LeafErrorSample objects.
+            fraction_summaries: Optional list of FractionQASummary for trend chart.
 
         Returns:
             PDF content as bytes.
@@ -127,6 +134,9 @@ class ReportGenerator:
 
         if leaf_samples:
             self._add_leaf_errors(elements, leaf_samples)
+
+        if fraction_summaries:
+            self._add_trend_chart(elements, fraction_summaries)
 
         self._add_analysis_notes(elements, qa_result)
         self._add_footer(elements)
@@ -313,6 +323,175 @@ class ReportGenerator:
             self.styles['InfoText']
         ))
 
+    def _add_trend_chart(self, elements: list, summaries: List[models.FractionQASummary]):
+        """Add fraction trend chart and summary."""
+        elements.append(Spacer(1, 0.2 * inch))
+        elements.append(Paragraph("Fraction Trend Analysis", self.styles['SectionHeader']))
+
+        if len(summaries) < 2:
+            elements.append(Paragraph(
+                "Insufficient fraction data for trend analysis (need at least 2 fractions).",
+                self.styles['InfoText']
+            ))
+            return
+
+        drawing = Drawing(6.5 * inch, 3 * inch)
+
+        chart_x = 0.8 * inch
+        chart_y = 0.5 * inch
+        chart_w = 5.5 * inch
+        chart_h = 2.2 * inch
+
+        valid_summaries = [s for s in summaries if s.rmse_mm is not None]
+        if len(valid_summaries) < 2:
+            elements.append(Paragraph(
+                "Insufficient valid data for trend chart.",
+                self.styles['InfoText']
+            ))
+            return
+
+        frac_nums = [s.fraction_number for s in valid_summaries]
+        rmse_vals = [s.rmse_mm for s in valid_summaries]
+        max_dev_vals = [s.max_leaf_deviation_mm for s in valid_summaries]
+
+        min_x, max_x = min(frac_nums), max(frac_nums)
+        all_vals = rmse_vals + max_dev_vals
+        min_y, max_y = 0, max(all_vals) * 1.15
+
+        if max_y == 0:
+            max_y = 1.0
+
+        x_range = max_x - min_x if max_x != min_x else 1
+        y_range = max_y - min_y if max_y != min_y else 1
+
+        def scale_x(x_val):
+            return chart_x + (x_val - min_x) / x_range * chart_w
+
+        def scale_y(y_val):
+            return chart_y + (y_val - min_y) / y_range * chart_h
+
+        drawing.add(Rect(
+            chart_x, chart_y, chart_w, chart_h,
+            fillColor=colors.HexColor('#f8f9fa'),
+            strokeColor=colors.HexColor('#bdc3c7'),
+            strokeWidth=0.5,
+        ))
+
+        for i in range(5):
+            y_val = min_y + (y_range * i / 4)
+            y_pos = scale_y(y_val)
+            drawing.add(Line(
+                chart_x, y_pos, chart_x + chart_w, y_pos,
+                strokeColor=colors.HexColor('#e0e0e0'),
+                strokeWidth=0.5,
+            ))
+            drawing.add(String(
+                chart_x - 5, y_pos - 4, f"{y_val:.2f}",
+                fontSize=7,
+                fillColor=colors.HexColor('#7f8c8d'),
+                textAnchor='end',
+            ))
+
+        for i, fx in enumerate(frac_nums):
+            x_pos = scale_x(fx)
+            drawing.add(String(
+                x_pos, chart_y - 12, f"F{fx}",
+                fontSize=7,
+                fillColor=colors.HexColor('#7f8c8d'),
+                textAnchor='middle',
+            ))
+
+        rmse_points = [(scale_x(f), scale_y(v)) for f, v in zip(frac_nums, rmse_vals)]
+        rmse_flat = []
+        for x, y in rmse_points:
+            rmse_flat.extend([x, y])
+
+        fill_flat_xs = rmse_xs = [p[0] for p in rmse_points]
+        fill_flat_ys = rmse_ys = [p[1] for p in rmse_points]
+        fill_points = rmse_flat[:]
+        for x in reversed(rmse_xs):
+            fill_points.extend([x, chart_y])
+
+        drawing.add(PolyLine(
+            fill_points,
+            fillColor=colors.HexColor('#3498db'),
+            fillOpacity=0.15,
+            strokeColor=None,
+        ))
+        drawing.add(PolyLine(
+            rmse_flat,
+            strokeColor=colors.HexColor('#2980b9'),
+            strokeWidth=2,
+        ))
+        for x, y in rmse_points:
+            from reportlab.graphics.shapes import Circle
+            drawing.add(Circle(x, y, 3, fillColor=colors.HexColor('#2980b9'), strokeColor=None))
+            drawing.add(String(x, y + 8, f"{y_range * (y - chart_y) / chart_h + min_y:.2f}",
+                fontSize=6, fillColor=colors.HexColor('#2c3e50'), textAnchor='middle'))
+
+        max_dev_points = [(scale_x(f), scale_y(v)) for f, v in zip(frac_nums, max_dev_vals)]
+        max_dev_flat = []
+        for x, y in max_dev_points:
+            max_dev_flat.extend([x, y])
+
+        drawing.add(PolyLine(
+            max_dev_flat,
+            strokeColor=colors.HexColor('#e74c3c'),
+            strokeWidth=1.5,
+            strokeDashArray=[4, 2],
+        ))
+        for x, y in max_dev_points:
+            from reportlab.graphics.shapes import Circle
+            drawing.add(Circle(x, y, 3, fillColor=colors.white, strokeColor=colors.HexColor('#e74c3c'), strokeWidth=1.5))
+
+        legend_y = chart_y + chart_h + 8
+        drawing.add(Rect(chart_x, legend_y, 10, 10,
+            fillColor=colors.HexColor('#2980b9')))
+        drawing.add(String(chart_x + 14, legend_y + 2, "RMSE (mm)",
+            fontSize=8, fillColor=colors.HexColor('#2c3e50')))
+        drawing.add(Rect(chart_x + 90, legend_y, 10, 10,
+            fillColor=colors.HexColor('#e74c3c')))
+        drawing.add(String(chart_x + 104, legend_y + 2, "Max Deviation (mm)",
+            fontSize=8, fillColor=colors.HexColor('#2c3e50')))
+
+        elements.append(drawing)
+        elements.append(Spacer(1, 0.1 * inch))
+
+        trend_data = [
+            ["Fraction", "RMSE (mm)", "Max Dev (mm)", "Pass Rate (%)", "Version"],
+        ]
+        for s in valid_summaries[:10]:
+            trend_data.append([
+                str(s.fraction_number),
+                f"{s.rmse_mm:.3f}" if s.rmse_mm else "N/A",
+                f"{s.max_leaf_deviation_mm:.3f}" if s.max_leaf_deviation_mm else "N/A",
+                f"{s.overall_pass_rate_pct:.1f}%" if s.overall_pass_rate_pct is not None else "N/A",
+                str(s.plan_version),
+            ])
+
+        trend_table = Table(trend_data, colWidths=[0.8 * inch, 1.2 * inch, 1.3 * inch, 1.2 * inch, 0.8 * inch])
+        trend_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#bdc3c7')),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ]))
+        elements.append(trend_table)
+
+        if len(valid_summaries) > 10:
+            elements.append(Spacer(1, 0.05 * inch))
+            elements.append(Paragraph(
+                f"... showing 10 of {len(valid_summaries)} fractions",
+                self.styles['InfoText']
+            ))
+
     def _add_analysis_notes(self, elements: list, qa_result: models.QAResult):
         """Add analysis notes section."""
         elements.append(Spacer(1, 0.2 * inch))
@@ -372,6 +551,7 @@ class ReportGenerator:
 def generate_qa_report_pdf(
     qa_result: models.QAResult,
     leaf_samples: Optional[list] = None,
+    fraction_summaries: Optional[List[models.FractionQASummary]] = None,
 ) -> bytes:
     """
     Convenience function to generate a PDF report.
@@ -379,9 +559,10 @@ def generate_qa_report_pdf(
     Args:
         qa_result: QAResult database object.
         leaf_samples: List of LeafErrorSample objects.
+        fraction_summaries: Optional list of FractionQASummary for trend chart.
 
     Returns:
         PDF content as bytes.
     """
     generator = ReportGenerator()
-    return generator.generate_report(qa_result, leaf_samples)
+    return generator.generate_report(qa_result, leaf_samples, fraction_summaries)

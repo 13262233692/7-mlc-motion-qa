@@ -761,3 +761,359 @@ def compute_statistics(values: np.ndarray) -> Dict[str, float]:
         "p95": float(np.percentile(values, 95)),
         "p99": float(np.percentile(values, 99)),
     }
+
+
+class TrendLabel(str, Enum):
+    """Trend classification labels."""
+    STABLE_NORMAL = "STABLE_NORMAL"
+    GRADUAL_INCREASE = "GRADUAL_INCREASE"
+    SHARP_INCREASE = "SHARP_INCREASE"
+    SINGLE_SPIKE = "SINGLE_SPIKE"
+    IMPROVING = "IMPROVING"
+    ERRATIC = "ERRATIC"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+    ALL_PASS = "ALL_PASS"
+    ALL_FAIL = "ALL_FAIL"
+
+
+@dataclass
+class FractionMetrics:
+    """Metrics for a single fraction (used in trend analysis)."""
+    fraction_number: int
+    plan_version: int
+    max_leaf_deviation_mm: float
+    mean_leaf_deviation_mm: float
+    rmse_mm: float
+    pass_rate_pct: float
+    overall_pass: bool
+    qa_date: Optional[Any] = None
+
+
+@dataclass
+class TrendAnalysisResult:
+    """Complete trend analysis result."""
+    trend_label: TrendLabel
+    trend_confidence: float
+    overall_description: str
+
+    total_fractions: int
+    plan_versions: List[int]
+    latest_fraction: int
+
+    max_deviation_slope: Optional[float] = None
+    pass_rate_slope: Optional[float] = None
+    latest_max_deviation: Optional[float] = None
+    latest_pass_rate: Optional[float] = None
+
+    anomaly_flags: List[str] = field(default_factory=list)
+    chart_data: Dict[str, Any] = field(default_factory=dict)
+
+    fraction_metrics: List[FractionMetrics] = field(default_factory=list)
+
+
+class TrendAnalyzer:
+    """Analyzer for detecting trends and anomalies in per-fraction QA data.
+
+    Detects patterns like:
+    - Gradual increase in leaf deviation (drift)
+    - Sharp increase / sudden degradation
+    - Single outlier spike
+    - Stable / normal pattern
+    - Improving trend
+    - Erratic / unstable pattern
+    """
+
+    def __init__(
+        self,
+        deviation_threshold_mm: float = 1.0,
+        pass_rate_threshold_pct: float = 95.0,
+        spike_threshold_mm: float = 1.5,
+        spike_confidence_factor: float = 1.8,
+        min_fractions_for_trend: int = 3,
+    ):
+        self.deviation_threshold_mm = deviation_threshold_mm
+        self.pass_rate_threshold_pct = pass_rate_threshold_pct
+        self.spike_threshold_mm = spike_threshold_mm
+        self.spike_confidence_factor = spike_confidence_factor
+        self.min_fractions_for_trend = min_fractions_for_trend
+
+    def analyze(self, fraction_metrics: List[FractionMetrics]) -> TrendAnalysisResult:
+        """Analyze trend across fractions.
+
+        Args:
+            fraction_metrics: List of per-fraction metrics, sorted by fraction number.
+
+        Returns:
+            TrendAnalysisResult with classification and details.
+        """
+        fraction_metrics = sorted(
+            fraction_metrics, key=lambda m: (m.plan_version, m.fraction_number)
+        )
+
+        if len(fraction_metrics) < 2:
+            return self._insufficient_data_result(fraction_metrics)
+
+        max_devs = np.array([m.max_leaf_deviation_mm for m in fraction_metrics])
+        pass_rates = np.array([m.pass_rate_pct for m in fraction_metrics])
+        fraction_numbers = np.array([m.fraction_number for m in fraction_metrics])
+        overall_pass = np.array([m.overall_pass for m in fraction_metrics])
+        plan_versions = sorted(set(m.plan_version for m in fraction_metrics))
+
+        slope_deviation, _ = self._linear_regression_slope(fraction_numbers, max_devs)
+        slope_pass_rate, _ = self._linear_regression_slope(fraction_numbers, pass_rates)
+
+        anomaly_flags = []
+        trend_label = TrendLabel.STABLE_NORMAL
+        confidence = 0.5
+
+        if np.all(overall_pass):
+            trend_label = TrendLabel.ALL_PASS
+            confidence = 0.9
+        elif not np.any(overall_pass):
+            trend_label = TrendLabel.ALL_FAIL
+            confidence = 0.95
+            anomaly_flags.append("All fractions failed QA")
+
+        if trend_label in (TrendLabel.ALL_PASS, TrendLabel.ALL_FAIL) and len(fraction_metrics) >= 3:
+            pass
+
+        if len(fraction_metrics) >= self.min_fractions_for_trend:
+            spike_idx = self._detect_single_spike(max_devs)
+            if spike_idx is not None:
+                trend_label = TrendLabel.SINGLE_SPIKE
+                confidence = min(0.95, 0.6 + 0.1 * len(fraction_metrics))
+                anomaly_flags.append(
+                    f"Single spike detected at fraction "
+                    f"{fraction_metrics[spike_idx].fraction_number}"
+                )
+
+        if trend_label not in (TrendLabel.SINGLE_SPIKE, TrendLabel.ALL_FAIL) and len(fraction_metrics) >= self.min_fractions_for_trend:
+            mean_dev = np.mean(max_devs)
+            std_dev = np.std(max_devs)
+
+            if slope_deviation > 0.05 and std_dev < mean_dev * 0.5:
+                if slope_deviation > 0.15:
+                    trend_label = TrendLabel.SHARP_INCREASE
+                    confidence = min(0.9, 0.5 + slope_deviation * 2)
+                else:
+                    trend_label = TrendLabel.GRADUAL_INCREASE
+                    confidence = min(0.85, 0.5 + slope_deviation)
+                anomaly_flags.append(
+                    f"Deviation trend increasing: {slope_deviation:.4f}mm/fraction"
+                )
+
+            elif slope_deviation < -0.05 and std_dev < mean_dev * 0.5:
+                trend_label = TrendLabel.IMPROVING
+                confidence = min(0.8, 0.5 + abs(slope_deviation))
+                anomaly_flags.append(
+                    f"Deviation trend decreasing: {slope_deviation:.4f}mm/fraction"
+                )
+
+            elif std_dev > mean_dev * 0.5 and len(fraction_metrics) >= 5:
+                trend_label = TrendLabel.ERRATIC
+                confidence = min(0.8, 0.5 + std_dev / mean_dev * 0.3)
+                anomaly_flags.append(
+                    f"Erratic pattern detected (CV={std_dev/mean_dev*100:.1f}%)"
+                )
+
+        if trend_label == TrendLabel.STABLE_NORMAL and len(fraction_metrics) >= self.min_fractions_for_trend:
+            mean_dev = np.mean(max_devs)
+            if mean_dev < self.deviation_threshold_mm:
+                confidence = 0.85
+            else:
+                confidence = 0.6
+
+        max_dev_baseline = max_devs[0] if len(max_devs) > 0 else 0.0
+        delta_from_first = float(max_devs[-1] - max_devs[0]) if len(max_devs) >= 2 else None
+
+        if delta_from_first is not None and abs(delta_from_first) > self.deviation_threshold_mm * 0.5:
+            if delta_from_first > 0:
+                anomaly_flags.append(
+                    f"Deviation increased by {delta_from_first:.2f}mm from first fraction"
+                )
+            else:
+                anomaly_flags.append(
+                    f"Deviation decreased by {abs(delta_from_first):.2f}mm from first fraction"
+                )
+
+        version_changes = [
+            m.plan_version for i, m in enumerate(fraction_metrics)
+            if i == 0 or m.plan_version != fraction_metrics[i-1].plan_version
+        ]
+        if len(version_changes) > 1:
+            anomaly_flags.append(
+                f"Plan re-planned {len(version_changes)-1} time(s): versions {version_changes}"
+            )
+
+        description = self._build_description(trend_label, anomaly_flags, len(fraction_metrics))
+
+        chart_data = {
+            "fraction_numbers": fraction_numbers.tolist(),
+            "max_deviation_mm": max_devs.tolist(),
+            "pass_rate_pct": pass_rates.tolist(),
+            "overall_pass": overall_pass.tolist(),
+            "plan_versions": [m.plan_version for m in fraction_metrics],
+            "deviation_threshold_mm": self.deviation_threshold_mm,
+            "pass_rate_threshold_pct": self.pass_rate_threshold_pct,
+            "slope_deviation_mm_per_fraction": float(slope_deviation) if slope_deviation is not None else None,
+            "slope_pass_rate_pct_per_fraction": float(slope_pass_rate) if slope_pass_rate is not None else None,
+        }
+
+        latest = fraction_metrics[-1] if fraction_metrics else None
+
+        return TrendAnalysisResult(
+            trend_label=trend_label,
+            trend_confidence=float(confidence),
+            overall_description=description,
+            total_fractions=len(fraction_metrics),
+            plan_versions=plan_versions,
+            max_deviation_slope=float(slope_deviation) if slope_deviation is not None else None,
+            pass_rate_slope=float(slope_pass_rate) if slope_pass_rate is not None else None,
+            latest_fraction=latest.fraction_number if latest else 0,
+            latest_max_deviation=float(latest.max_leaf_deviation_mm) if latest else None,
+            latest_pass_rate=float(latest.pass_rate_pct) if latest else None,
+            anomaly_flags=anomaly_flags,
+            chart_data=chart_data,
+            fraction_metrics=fraction_metrics,
+        )
+
+    @staticmethod
+    def _linear_regression_slope(x: np.ndarray, y: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
+        """Simple linear regression returning slope and r_value.
+
+        Returns (slope, r_value) or (None, None) if insufficient data.
+        """
+        if len(x) < 2 or len(y) < 2 or len(x) != len(y):
+            return None, None
+
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+
+        x_mean = np.mean(x)
+        y_mean = np.mean(y)
+
+        numerator = np.sum((x - x_mean) * (y - y_mean))
+        denominator = np.sum((x - x_mean) ** 2)
+
+        if abs(denominator) < 1e-10:
+            return None, None
+
+        slope = numerator / denominator
+        intercept = y_mean - slope * x_mean
+
+        y_pred = intercept + slope * x
+        ss_res = np.sum((y - y_pred) ** 2)
+        ss_tot = np.sum((y - y_mean) ** 2)
+
+        if ss_tot < 1e-10:
+            r_value = 1.0
+        else:
+            r_value = float(1.0 - ss_res / ss_tot)
+            r_value = np.sign(slope) * np.sqrt(abs(r_value))
+
+        return float(slope), float(r_value)
+
+    def _detect_single_spike(self, values: np.ndarray) -> Optional[int]:
+        """Detect a single outlier spike in a series.
+
+        Uses the spike_confidence_factor * std_dev rule.
+        Returns the index of the spike, or None if no spike detected.
+        """
+        if len(values) < 4:
+            return None
+
+        mean_val = np.mean(values)
+        std_val = np.std(values)
+
+        if std_val < 1e-6:
+            return None
+
+        deviations = np.abs(values - mean_val) / std_val
+        spike_indices = np.where(deviations > self.spike_confidence_factor)[0]
+
+        if len(spike_indices) == 1:
+            spike_idx = int(spike_indices[0])
+            spike_val = values[spike_idx]
+            others_mask = np.ones(len(values), dtype=bool)
+            others_mask[spike_idx] = False
+            others_mean = np.mean(values[others_mask])
+            if spike_val > others_mean and spike_val > self.spike_threshold_mm:
+                return spike_idx
+
+        return None
+
+    @staticmethod
+    def _insufficient_data_result(fraction_metrics: List[FractionMetrics]) -> TrendAnalysisResult:
+        """Build result for insufficient data."""
+        plan_versions = sorted(set(m.plan_version for m in fraction_metrics))
+        latest = fraction_metrics[-1] if fraction_metrics else None
+
+        return TrendAnalysisResult(
+            trend_label=TrendLabel.INSUFFICIENT_DATA,
+            trend_confidence=1.0,
+            overall_description=(
+                f"Insufficient data for trend analysis "
+                f"({len(fraction_metrics)} fraction(s)). "
+                f"At least 3 fractions are recommended."
+            ),
+            total_fractions=len(fraction_metrics),
+            plan_versions=plan_versions,
+            latest_fraction=latest.fraction_number if latest else 0,
+            latest_max_deviation=float(latest.max_leaf_deviation_mm) if latest else None,
+            latest_pass_rate=float(latest.pass_rate_pct) if latest else None,
+            chart_data={
+                "fraction_numbers": [m.fraction_number for m in fraction_metrics],
+                "max_deviation_mm": [m.max_leaf_deviation_mm for m in fraction_metrics],
+                "pass_rate_pct": [m.pass_rate_pct for m in fraction_metrics],
+            },
+            fraction_metrics=fraction_metrics,
+        )
+
+    @staticmethod
+    def _build_description(
+        trend_label: TrendLabel,
+        anomaly_flags: List[str],
+        num_fractions: int,
+    ) -> str:
+        """Build human-readable trend description."""
+        descriptions = {
+            TrendLabel.STABLE_NORMAL: (
+                f"QA results across {num_fractions} fractions are stable and within normal range."
+            ),
+            TrendLabel.GRADUAL_INCREASE: (
+                f"Leaf deviation shows a gradual increasing trend across {num_fractions} fractions. "
+                f"May indicate wear or misalignment."
+            ),
+            TrendLabel.SHARP_INCREASE: (
+                f"Leaf deviation shows a sharp increase across {num_fractions} fractions. "
+                f"Investigation recommended."
+            ),
+            TrendLabel.SINGLE_SPIKE: (
+                f"Single outlier fraction detected among {num_fractions} total. "
+                f"Most likely a one-time issue."
+            ),
+            TrendLabel.IMPROVING: (
+                f"Leaf deviation is trending downward across {num_fractions} fractions. "
+                f"Performance is improving."
+            ),
+            TrendLabel.ERRATIC: (
+                f"QA results are erratic and inconsistent across {num_fractions} fractions. "
+                f"May indicate unstable delivery conditions."
+            ),
+            TrendLabel.ALL_PASS: (
+                f"All {num_fractions} fractions passed QA. Plan performance is consistent."
+            ),
+            TrendLabel.ALL_FAIL: (
+                f"All {num_fractions} fractions failed QA. Critical issue requires attention."
+            ),
+            TrendLabel.INSUFFICIENT_DATA: (
+                "Not enough data for reliable trend analysis."
+            ),
+        }
+
+        desc = descriptions.get(trend_label, "Trend analysis complete.")
+        if anomaly_flags:
+            desc += " Anomalies: " + "; ".join(anomaly_flags[:3])
+            if len(anomaly_flags) > 3:
+                desc += f" (+{len(anomaly_flags)-3} more)"
+        return desc
