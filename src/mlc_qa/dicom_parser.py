@@ -58,9 +58,18 @@ class BeamData:
         """Get dose rates array."""
         return np.array([cp.dose_rate for cp in self.control_points])
 
-    def get_gantry_angles(self) -> np.ndarray:
-        """Get gantry angles array."""
-        return np.array([cp.gantry_angle for cp in self.control_points])
+    def get_gantry_angles(self, unwrap: bool = False) -> np.ndarray:
+        """Get gantry angles array.
+
+        Args:
+            unwrap: If True, unwrap angles to avoid 0/360 discontinuity.
+        """
+        angles = np.array([cp.gantry_angle for cp in self.control_points], dtype=np.float64)
+        if unwrap:
+            if len(angles) >= 2:
+                unwrapped = np.unwrap(np.deg2rad(angles))
+                angles = np.rad2deg(unwrapped)
+        return angles
 
     def get_leaf_positions_bank_a(self) -> np.ndarray:
         """Get bank A leaf positions array (num_control_points x num_leaves)."""

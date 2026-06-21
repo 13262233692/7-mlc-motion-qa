@@ -21,6 +21,115 @@ from mlc_qa.log_parser import TreatmentLog
 from mlc_qa.config import MAX_LEAF_DEVIATION_THRESHOLD, CONTROL_POINT_PASS_THRESHOLD
 
 
+def circular_angle_distance_deg(angle1: np.ndarray, angle2: np.ndarray) -> np.ndarray:
+    """
+    Calculate the minimum circular distance between two angles (in degrees).
+
+    Handles 0/360 wraparound correctly. Returns the smaller of the
+    clockwise or counter-clockwise arc between the two angles.
+
+    Args:
+        angle1: First angle(s) in degrees [0, 360).
+        angle2: Second angle(s) in degrees [0, 360).
+
+    Returns:
+        Minimum distance in degrees, always in [0, 180].
+    """
+    diff = np.abs(np.asarray(angle1, dtype=np.float64) - np.asarray(angle2, dtype=np.float64))
+    return np.minimum(diff, 360.0 - diff)
+
+
+def circular_abs_diff_deg(angle1: np.ndarray, angle2: np.ndarray) -> np.ndarray:
+    """
+    Calculate the signed circular difference (angle2 - angle1) in degrees.
+
+    Handles wraparound. Result is in [-180, 180].
+    Positive means clockwise from angle1 to angle2.
+    """
+    a1 = np.asarray(angle1, dtype=np.float64) % 360.0
+    a2 = np.asarray(angle2, dtype=np.float64) % 360.0
+    diff = a2 - a1
+    diff = np.where(diff > 180.0, diff - 360.0, diff)
+    diff = np.where(diff < -180.0, diff + 360.0, diff)
+    return diff
+
+
+def unwrap_angles_deg(angles: np.ndarray) -> np.ndarray:
+    """
+    Unwrap angles in degrees by detecting 0/360 jumps.
+
+    This is more robust than np.unwrap when:
+    - Angles are sparsely sampled
+    - There is small jitter around the 0/360 boundary
+    - Direction needs to be auto-detected
+
+    Args:
+        angles: Angles in degrees (wrapped, [0, 360)).
+
+    Returns:
+        Unwrapped angles in degrees (monotonic if angles change smoothly).
+    """
+    angles = np.asarray(angles, dtype=np.float64)
+    if len(angles) < 2:
+        return angles.copy()
+
+    wrapped = angles % 360.0
+    result = wrapped.copy()
+
+    for i in range(1, len(result)):
+        step = wrapped[i] - wrapped[i - 1]
+        if step > 180.0:
+            step -= 360.0
+        elif step < -180.0:
+            step += 360.0
+        result[i] = result[i - 1] + step
+
+    return result
+
+
+def align_angles_to_reference(
+    angles_to_align: np.ndarray,
+    reference_angles: np.ndarray,
+) -> np.ndarray:
+    """
+    Align wrapped angles to be on the same "unwrapped branch" as reference.
+
+    This ensures that both plan and log angles are unwrapped consistently
+    before interpolation, so that small wraparound jumps (e.g., 359.8 → 0.2)
+    are treated as the small step (~0.4°) they actually are.
+
+    Args:
+        angles_to_align: Wrapped angles [0, 360) to be aligned.
+        reference_angles: Wrapped reference angles [0, 360) for direction context.
+
+    Returns:
+        Unwrapped angles for `angles_to_align` that are consistent with
+        the trajectory implied by `reference_angles`.
+    """
+    ref_unwrapped = unwrap_angles_deg(np.asarray(reference_angles, dtype=np.float64))
+    to_align_wrapped = np.asarray(angles_to_align, dtype=np.float64) % 360.0
+
+    if len(ref_unwrapped) < 2 or len(to_align_wrapped) < 2:
+        return unwrap_angles_deg(to_align_wrapped)
+
+    direction = 1.0 if ref_unwrapped[-1] >= ref_unwrapped[0] else -1.0
+
+    aligned = to_align_wrapped.copy()
+    for i in range(1, len(aligned)):
+        step = aligned[i] - aligned[i - 1]
+        if direction > 0 and step < -180.0:
+            step += 360.0
+        elif direction < 0 and step > 180.0:
+            step -= 360.0
+        aligned[i] = aligned[i - 1] + step
+
+    ref_start = ref_unwrapped[0]
+    start_diff = circular_abs_diff_deg(aligned[0], ref_start)
+    aligned = aligned + (ref_start - (aligned[0] - start_diff))
+
+    return aligned
+
+
 class InterpolationMethod(str, Enum):
     """Interpolation method for alignment."""
     LINEAR = "linear"
@@ -154,19 +263,37 @@ class MLCQACalculator:
         log_weights = log.get_meterset_weights()
 
         plan_dose_rates = beam.get_dose_rates()
-        plan_gantry = beam.get_gantry_angles()
+        plan_gantry_wrapped = beam.get_gantry_angles(unwrap=False)
         plan_leaves_a = beam.get_leaf_positions_bank_a()
         plan_leaves_b = beam.get_leaf_positions_bank_b()
 
         log_timestamps = log.get_timestamps()
         log_dose_rates = log.get_dose_rates()
-        log_gantry = log.get_gantry_angles(unwrap=True)
+        log_gantry_wrapped = log.get_gantry_angles(unwrap=False)
         log_leaves_a = log.get_leaf_positions_bank_a()
         log_leaves_b = log.get_leaf_positions_bank_b()
 
         if not np.all(np.diff(log_weights) >= 0):
             warnings.append("Log meterset weights are not monotonically increasing")
             log_weights = np.maximum.accumulate(log_weights)
+
+        plan_gantry_unwrapped = align_angles_to_reference(
+            angles_to_align=plan_gantry_wrapped,
+            reference_angles=log_gantry_wrapped,
+        )
+        log_gantry_unwrapped = unwrap_angles_deg(log_gantry_wrapped)
+
+        gantry_raw_steps = np.abs(np.diff(log_gantry_wrapped))
+        gantry_max_raw_step = float(np.max(gantry_raw_steps)) if len(gantry_raw_steps) >= 1 else 0.0
+        gantry_max_step_unwrapped = float(np.max(np.abs(
+            np.diff(log_gantry_unwrapped)
+        ))) if len(log_gantry_unwrapped) >= 2 else 0.0
+        if gantry_max_raw_step > 90.0 and gantry_max_step_unwrapped < 5.0:
+            warnings.append(
+                f"Gantry angle wraparound detected (max raw step="
+                f"{gantry_max_raw_step:.1f}°, max unwrapped step="
+                f"{gantry_max_step_unwrapped:.1f}°). Using circular interpolation."
+            )
 
         plan_to_log_time = self._create_time_weight_mapping(
             log_timestamps, log_weights
@@ -183,9 +310,22 @@ class MLCQACalculator:
         interp_log_dose_rates = self._interpolate_to_control_points(
             log_timestamps, log_dose_rates[:, np.newaxis], plan_times
         ).flatten()
-        interp_log_gantry = self._interpolate_gantry(
-            log_timestamps, log_gantry, plan_times
+        interp_log_gantry_unwrapped = self._interpolate_unwrapped(
+            log_timestamps, log_gantry_unwrapped, plan_times
         )
+        interp_log_gantry_wrapped = interp_log_gantry_unwrapped % 360.0
+
+        gantry_discrepancies = circular_angle_distance_deg(
+            interp_log_gantry_wrapped, plan_gantry_wrapped
+        )
+        max_gantry_discrepancy = float(np.max(gantry_discrepancies))
+        mean_gantry_discrepancy = float(np.mean(gantry_discrepancies))
+        if max_gantry_discrepancy > 5.0:
+            warnings.append(
+                f"Large gantry angle discrepancy detected: max="
+                f"{max_gantry_discrepancy:.1f}°, mean="
+                f"{mean_gantry_discrepancy:.1f}°"
+            )
 
         deviation_a = np.abs(interp_log_leaves_a - plan_leaves_a)
         deviation_b = np.abs(interp_log_leaves_b - plan_leaves_b)
@@ -228,7 +368,7 @@ class MLCQACalculator:
                     / max(plan_dose_rates[i], 1e-6)
                     * 100
                 ),
-                gantry_angle_deg=float(interp_log_gantry[i] % 360),
+                gantry_angle_deg=float(interp_log_gantry_wrapped[i]),
             )
             control_point_results.append(cp_result)
 
@@ -268,8 +408,8 @@ class MLCQACalculator:
             timestamp_sec=float(plan_times[max_cp]),
         )
 
-        gantry_start = float(plan_gantry[0]) if len(plan_gantry) > 0 else 0.0
-        gantry_end = float(plan_gantry[-1]) if len(plan_gantry) > 0 else 0.0
+        gantry_start = float(plan_gantry_wrapped[0]) if len(plan_gantry_wrapped) > 0 else 0.0
+        gantry_end = float(plan_gantry_wrapped[-1]) if len(plan_gantry_wrapped) > 0 else 0.0
 
         if not log.get_sampling_statistics()["is_uniform"]:
             warnings.append(
@@ -465,6 +605,36 @@ class MLCQACalculator:
         return result
 
     @staticmethod
+    def _interpolate_unwrapped(
+        source_times: np.ndarray,
+        unwrapped_values: np.ndarray,
+        target_times: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Interpolate pre-unwrapped values (angles in degrees) linearly.
+
+        This method works on already-unwrapped angle data to avoid
+        0/360 discontinuities during interpolation. Values are kept
+        in unwrapped form; caller should apply % 360 if wrapped output is needed.
+
+        Args:
+            source_times: Source timestamps (1D).
+            unwrapped_values: Pre-unwrapped angles in degrees (1D).
+            target_times: Target timestamps (1D).
+
+        Returns:
+            Interpolated unwrapped angles in degrees (1D).
+        """
+        interpolated = np.interp(
+            target_times,
+            source_times,
+            unwrapped_values,
+            left=unwrapped_values[0],
+            right=unwrapped_values[-1],
+        )
+        return interpolated
+
+    @staticmethod
     def _interpolate_gantry(
         source_times: np.ndarray,
         gantry_angles: np.ndarray,
@@ -474,8 +644,9 @@ class MLCQACalculator:
         Interpolate gantry angles, handling wraparound properly.
 
         Uses unwrapped angles for interpolation, then wraps back to [0, 360).
+        Kept for backward compatibility.
         """
-        unwrapped = np.unwrap(np.deg2rad(gantry_angles))
+        unwrapped = unwrap_angles_deg(gantry_angles)
         interpolated = np.interp(
             target_times,
             source_times,
@@ -483,7 +654,7 @@ class MLCQACalculator:
             left=unwrapped[0],
             right=unwrapped[-1],
         )
-        return np.rad2deg(interpolated) % 360
+        return interpolated % 360.0
 
     def _sample_leaf_errors(
         self,
